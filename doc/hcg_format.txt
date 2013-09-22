@@ -1,0 +1,3 @@
+All hcg packages start with magic number: "HCGxxxx\r\n", where xxxx stands for hcg package version.
+
+

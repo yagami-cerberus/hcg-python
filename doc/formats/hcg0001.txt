@@ -1,0 +1,43 @@
+HCG package version: 0001
+
+File Structure:
+    char[8] magicnumber = "HCG001\r\n"
+    char[8] comment_length = "000000\r\n"   ; note: comment is a hex number in ascii
+    char[comment_length] comment
+    
+    ; index at head
+    uint_64 image_index_length
+    image_header[] image_index              ; look for Image Header Structure
+    uint_32 index_crc32
+    
+    ; data
+    char[] image_data
+
+    char[8] tail_magicnumber = "\x0\x0\x0\x0\x0\x0\x0\x0"
+    
+    ; index at tail
+    uint_64 image_index_length
+    image_header[] image_index
+    uint_32 index_crc32
+    
+    uint_64 tail_magicnumber_position       ; "index at tail" offset (start from image_index_length)
+    
+Image Header Structure
+    ; image name length
+    uint_16 image_key_len
+    
+    ; image data offset 
+    uint_64 image_position
+    
+    ; if this image contains a reference image, this value is index offset of the reference image
+    uint_64 image_ref_header_position
+    
+    ; image data length
+    uint_32 image_length;
+    
+    ; image data crc32
+    uint_32 image_crc;
+    
+    ; image name
+    char[image_key_len] image_key;
+
