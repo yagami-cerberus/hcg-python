@@ -1,0 +1,199 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import os
+import sys
+import shutil
+import tempfile
+import argparse
+from multiprocessing import cpu_count
+from PIL import Image
+
+from hcg.archive import HCGArchive
+from hcg.utils import evaluate_image_diff
+from hcg.packer import HCHPacker, HCGPackImage
+from hcg.threading_pool import ThreadPool, ThreadPoolWorker
+
+def main():
+    parser = argparse.ArgumentParser(description='Hayate CG Archive Manager')
+    
+    subparsers = parser.add_subparsers(title='commands', dest='cmd', help='to do...')
+    
+    # Create archive
+    parser_create = subparsers.add_parser('c', help='Create a new HCG Archive')
+    
+    parser_create.add_argument('target', metavar='target', type=str, help='Output file')
+    parser_create.add_argument('source', metavar='source', type=str, help='Directory to archive')
+    
+    # Test Archive
+    parser_test = subparsers.add_parser('t', help='Test a HCG Archive')
+    parser_test.add_argument('filename', metavar='filename', type=str, help='A HCG archive to test')
+
+    # Expend Archive
+    parser_expend = subparsers.add_parser('x', help='Extract all images in the Archive')
+    parser_expend.add_argument('filename', metavar='filename', type=str, help='A HCG archive to extract')
+    parser_expend.add_argument('path_to_extract', metavar='path_to_extract', type=str, help='Extract image to')
+
+    options = parser.parse_args()
+    
+    if options.cmd == 'c':
+        create_archive(options.source, options.target)
+    elif options.cmd == 't':
+        test_archive(options.filename)
+    elif options.cmd == 'x':
+        extract_archive(options.filename, options.path_to_extract)
+
+def create_archive(source, target):
+    tempfolder = tempfile.mktemp()
+    os.mkdir(tempfolder)
+    
+    try:
+        images_set = _locate_images(source) # set({HCGPackImage, ...})
+        _sampling_images(images_set)
+        images_group = _grouping_images(images_set) # {group_id: [HCGPackImage, ....]}
+        images_ref = {} # {HCGPackImage: ref HCGPackImage}
+    
+        for group, images in images_group.items():
+            r = _rank_images(images)
+            for key, data in r.items():
+                refs, stddiv = data
+                images_ref[key] = refs
+    
+        _find_your_daddy(images_set, images_ref, tempfolder)
+        
+        if not target.endswith(".hcg"): target += ".hcg"
+        packer = HCHPacker(target)
+        packer.write_comment_header()
+        packer.write_body(list(images_set))
+        packer.close()
+    finally:
+        shutil.rmtree(tempfolder)
+
+def test_archive(filename):
+    archive = HCGArchive(filename)
+    archive.validate_header_index()
+    
+    sys.stdout.write("Loading archive index ...")
+    sys.stdout.flush()
+    images = archive.get_images()
+    print("OK\n")
+    for image in images:
+        sys.stdout.write("Testing\t\t%s ... " % image.key)
+        sys.stdout.flush()
+        
+        crc = image.calculate_crc32()
+        if image.crc32 == crc:
+            print("OK")
+        else:
+            raise RuntimeError("CRC32 validate failed (get %x but should be %x)" % (crc, image.crc32))
+    
+    archive.validate_tail_index()
+    print("All OK\n")
+
+def extract_archive(filename, extract_to):
+    name = os.path.splitext(os.path.basename(filename))[0]
+    basepath = os.path.join(extract_to, name)
+    
+    archive = HCGArchive(filename)
+    
+    images = archive.get_images()
+    
+    for image in images:
+        if image.ref:
+            sys.stdout.write("Extract \t\t%s (ref %s)... " % (image.key, image.ref.key))
+        else:
+            sys.stdout.write("Extract \t\t%s ... " % image.key)
+            
+        sys.stdout.flush()
+        image.extract_to(basepath)
+        print("OK")
+        
+
+def _locate_images(source):
+    images_set = set()
+    for path, dirs, files in os.walk(source):
+        for file in files:
+            f = file.lower()
+            
+            if not (f.endswith(".png") or f.endswith(".jpg")):
+                print("ignore: '%s'" % f)
+                continue
+            
+            abspath = os.path.join(path, file)
+            key = os.path.relpath(abspath, source)
+            hcg_image = HCGPackImage(key, abspath)
+            images_set.add(hcg_image)
+    
+    return images_set
+
+def _sampling_images(images_set):
+    pool = ThreadPool(SamplingWorker, pool_size=cpu_count())
+    
+    for img in images_set:
+        print("Sampling: %s" % img.key)
+        pool.assign_task(img)
+    
+    pool.shutdown()
+    pool.wait()
+    
+def _grouping_images(images_set):
+    groups = {}
+    for img in images_set:
+        group = img.group
+        
+        if group in groups:
+            groups[group].append(img)
+        else:
+            groups[group] = [img]
+    
+    return groups
+
+def _rank_images(images_set):
+    images = list(images_set)
+    images.sort()
+    images.reverse()
+    
+    ranked_image = {}
+    
+    T = len(images)
+    i, j = 0, 0
+    while i < T:
+        this, j = images[i], (i + 1)
+        that, score = None, float("inf")
+        while j < T:
+            s = evaluate_image_diff(this, images[j])
+            if s < score:
+                that, score = images[j], s
+            j += 1
+        ranked_image[this] = (that, score)
+        i += 1
+        
+    return ranked_image
+
+def _find_your_daddy(images_set, images_ref, tempfolder):
+    images = list(images_set)
+    images.sort()
+    
+    for image in images:
+        ref = images_ref.get(image)
+        
+        if not ref:
+            # No daddy found
+            continue
+        
+        if ref.ref:
+            # Get root image
+            ref = ref.ref 
+        
+        image.make_ref(ref, tempfolder)
+
+class SamplingWorker(ThreadPoolWorker):
+    def on_task(self, img):
+        img.sample
+    
+    def on_error(self, task, error):
+        print("Something is wrong with error: %s"%(", ".join(error.args)))
+
+if __name__ == '__main__':
+    main()
+
