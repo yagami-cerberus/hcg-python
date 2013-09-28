@@ -33,3 +33,10 @@ nosetests.xml
 thumb.db
 ._*
 .DS_Store
+
+# hcg
+*.hcg
+
+# cython
+src/compress.c
+src/sampling.c

@@ -1,10 +1,15 @@
 
 import os
+from threading import Event, Lock
 
 from PIL import Image
 
+from hcg import _sampling
+from hcg import _compress
+from hcg.compress import diff_buffer, merge_buffer
+from hcg.sampling import sampling_bbox, split_rect
+from hcg.threading_pool import ThreadPool
 from hcg.utils import BytesIO
-from hcg.utils import sampling_bbox, split_rect
 
 __all__ = ["HCGImage"]
 
@@ -13,6 +18,10 @@ class HCGImage(object):
     _size = None
     _crc32 = None
     _sample = None
+    _sample_ttl = None
+    _sample_event = None
+    _sample_lock = None
+    
     
     def __init__(self, key):
         self.key = key
@@ -51,17 +60,68 @@ class HCGImage(object):
     
     @property
     def sample(self):
-        # This method create features for image, if two image has same group
-        # ths sample must contains same dimension sample.
         if not self._sample:
-            sample = []
-            img = self.get_origin_image()
-            w, h = img.size
-            for bbox in split_rect(w, h):
-                sample.append(sampling_bbox(img.getdata(), w, h, bbox))
-            self._sample = sample
+            self.make_sample()
+        
+        while self._sample_event.wait(0.5) == False:
+            pass
+        
         return self._sample
     
+    def make_sample(self):
+        # This method create features for image, if two image has same group
+        # ths sample must contains same dimension samples.
+        
+        img = self.get_origin_image()
+        
+        if img.mode == "RGB":
+            bands = 3
+        elif img.mode == "RGBA":
+            bands = 4
+        elif img.mode == "L":
+            bands = 1
+        else:
+            raise RuntimeError("Sampling only work for 8-bits depth image")
+        
+        if self._sample_event and self._sample_event.is_set() == False:
+            # Another sampling task is running
+            return
+        else:
+            self._sample_event = Event()
+            self._sample_lock = Lock()
+        
+        w, h = img.size
+        
+        regions = []
+        self._sample = []
+        self._sample_ttl = 0
+        
+        for bbox in split_rect(w, h):
+            self._sample.append(None)
+            regions.append((self._sample_ttl, bbox))
+            self._sample_ttl += 1
+        
+        pool = ThreadPool.default_pool()
+        
+        # @CYTHON
+        data = img.tobytes()
+        
+        for index, bbox in regions:
+            pool.assign_task((_sampling.sampling_bbox, (data, w, h, bands, bbox, self._make_sample_cb, index), {}))
+        # @NATIVE
+        # data = bytearray(img.tobytes())
+        # 
+        # for index, bbox in regions:
+        #     pool.assign_task((sampling_bbox, (data, w, h, bands, bbox, self._make_sample_cb, index), {}))
+        # @END
+    
+    def _make_sample_cb(self, index, result):
+        self._sample[index] = result
+        
+        with self._sample_lock:
+            self._sample_ttl -= 1
+            if self._sample_ttl == 0:
+                self._sample_event.set()
     
     def get_image(self):
         # return PIL Image object, if image is compressed
@@ -75,35 +135,44 @@ class HCGImage(object):
             ref_img = self._ref.get_image()
             diff_img = self.get_image()
             
-            ref_data = bytearray(ref_img.tobytes())
-            data = bytearray(diff_img.tobytes())
+            # @CYTHON
+            ref_data = ref_img.tobytes()
+            data = diff_img.tobytes()
+            _compress.merge_buffer(data, ref_data, len(data))
+            return Image.frombytes(ref_img.mode, ref_img.size, data)
             
-            i, l = 0, len(data)
-            assert len(data) == len(ref_data)
-            while i < l:
-                data[i] = (data[i] + ref_data[i]) % 256
-                i += 1
-            
-            return Image.frombytes(ref_img.mode, ref_img.size, bytes(data))
+            # @NATIVE
+            # ref_data = bytearray(ref_img.tobytes())
+            # data = bytearray(diff_img.tobytes())
+            # 
+            # merge_buffer(data, ref_data, len(data))
+            # 
+            # return Image.frombytes(ref_img.mode, ref_img.size, bytes(data))
+            # @END
         else:
             return self.get_image()
 
     def get_data(self):
         # return bytes data
         raise RuntimeError("Override this method.")
-        
+    
     def create_diff_image(self, ref_image):
-        data = bytearray(self.get_image_data())
-        ref_data = bytearray(ref_image.get_image_data())
+        img = self.get_image()
+
+        # @CYTHON
+        data = img.tobytes()
+        ref_data = ref_image.get_image_data()
+        _compress.diff_buffer(data, ref_data, len(data))
         
-        i, l = 0, len(data)
-        while i < l:
-            _ = data[i] - ref_data[i]
-            if _ < 0: _ += 256
-            data[i] = _
-            i += 1
-        
-        img = Image.frombytes(self.obj.mode, self.obj.size, bytes(data))
+        img = Image.frombytes(img.mode, img.size, data)
+        # @NATIVE
+        # data = bytearray(img.tobytes())
+        # ref_data = bytearray(ref_image.get_image_data())
+        # 
+        # diff_buffer(data, ref_data, len(data))
+        # 
+        # img = Image.frombytes(img.mode, img.size, bytes(data))
+        # @END
         
         f = BytesIO()
         img.save(f, "png")
@@ -165,3 +234,4 @@ class HCGImage(object):
         else:
             if s > o: return 1
             else: return -1
+

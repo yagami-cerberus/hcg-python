@@ -7,7 +7,6 @@ from binascii import crc32
 from PIL import Image
 
 from hcg.image import HCGImage
-# from hcg.utils import sampling_bbox, split_rect
 from hcg.utils import BytesIO
 
 P_UINT64 = struct.Struct("<Q")
@@ -193,5 +192,7 @@ class HCGPackImage(HCGImage):
             
             return True
         else:
+            # import IPython
+            # IPython.embed()
             return False
     
